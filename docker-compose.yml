@@ -1,0 +1,8 @@
+services:
+  spark-job:
+    build: .
+    container_name: spark-job
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: python src/etl.py

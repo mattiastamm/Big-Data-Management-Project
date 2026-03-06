@@ -2,6 +2,53 @@
 
 
 
+## Running the Project
+
+The ETL pipeline can be executed using Docker to ensure a consistent environment across different systems.
+
+### Prerequisites
+
+- Docker Desktop (or Docker Engine with Docker Compose)
+
+Make sure Docker is running:
+
+`docker version`
+
+### Run the Pipeline
+
+1. Place the input parquet files into:
+
+`data/inbox/`
+
+2. Build the Docker image:
+
+`docker compose build`
+
+3. Run the ETL pipeline:
+
+`docker compose run --rm spark-job`
+
+The pipeline will automatically:
+
+- detect new parquet files in `data/inbox/`
+- process and clean the data
+- remove duplicates
+- enrich the dataset with taxi zone information
+- update `state/manifest.json` to track processed files
+
+### Adding New Data
+
+To process additional files, simply add new parquet files to:
+
+`data/inbox/`
+
+and run the pipeline again:
+
+`docker compose run --rm spark-job`
+
+Only previously unprocessed files will be processed.
+
+
 
 ## Data Cleaning
 
