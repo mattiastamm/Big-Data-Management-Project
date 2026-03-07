@@ -15,7 +15,7 @@ INBOX_DIR = DATA_DIR / "inbox"
 STATE_DIR = BASE_DIR / "state"
 MANIFEST_PATH = STATE_DIR / "manifest.json"
 LOOKUP_PATH = DATA_DIR / "taxi_zone_lookup.parquet"
-
+OUTBOX_DIR = DATA_DIR / "outbox"
 
 
 # ===================================================================
@@ -40,6 +40,39 @@ def load_manifest(manifest_path: Path) -> dict[str, Any]:
         manifest["processed_files"] = []
 
     return manifest
+
+def update_manifest(manifest: dict[str, Any], new_files: list[Path], ingestion_ts: datetime, rows_written: int) -> None:
+    """
+    Write the updated manifest back to disk.
+    """
+    try:
+        new_entries = [
+                {
+                    "filename": f.name,
+                    "processed_at": ingestion_ts.isoformat(),
+                    "file_size": f.stat().st_size,
+                }
+                for f in new_files
+        ]
+
+        manifest["processed_files"].extend(new_entries)
+        
+        print(f"Manifest updated with {len(new_files)} new file(s).")
+
+        manifest["last_run"] = {
+            "processed_at": ingestion_ts.isoformat(),
+            "files": [f.name for f in new_files],
+            "rows_written": rows_written
+        }
+
+        with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+    except Exception as e:
+        print(f"Error updating manifest: {e}")
+        raise
+
+    return None
 
 
 def list_inbox_files(inbox_dir: Path) -> list[Path]:
@@ -77,12 +110,12 @@ def create_spark_session() -> SparkSession:
     return (
         SparkSession.builder
         .appName("Incremental Taxi ETL")
-        .master("local[*]")
+        .master("local[*]") # Use all CPU cores for better performane
+        .config("spark.sql.shuffle.partitions", "8") # Reduce shuffle partitions for small datasets (from default 200 to 8), because most partitions will be empty; speeds up operations locally
+        .config("spark.driver.memory", "4g")   # Allocate more memory for the driver (Default is 1GB)
+        .config("spark.executor.memory", "4g") # Allocate more memory for the executor (Default is 1GB)
         .getOrCreate()
     )
-
-
-from datetime import datetime, timezone
 
 
 def extract_new_data(spark: SparkSession, new_files: list[Path], ingestion_ts: datetime, ) -> DataFrame | None:
@@ -146,6 +179,7 @@ REQUIRED_COLUMNS = [
     "total_amount",
     "source_file",
     "ingested_at",
+    "payment_type",
 ]
 
 
@@ -177,6 +211,7 @@ def select_and_cast_columns(df: DataFrame) -> DataFrame:
         F.col("total_amount").cast("double").alias("total_amount"),
         F.col("source_file"),
         F.col("ingested_at").cast("timestamp").alias("ingested_at"),
+        F.col("payment_type").cast("int").alias("payment_type"),
     )
 
     return df
@@ -340,13 +375,13 @@ def enrich_with_zones(spark: SparkSession, df: DataFrame, lookup_path: Path) -> 
     )
 
     df = df.join(
-        F.broadcast(pickup_lookup),
+        F.broadcast(pickup_lookup), # Broadcast join since lookup is small, improves performance by avoiding shuffle
         df["PULocationID"] == pickup_lookup["pickup_LocationID"],
         how="left",
     )
 
     df = df.join(
-        F.broadcast(dropoff_lookup),
+        F.broadcast(dropoff_lookup), # Broadcast join since lookup is small, improves performance by avoiding shuffle
         df["DOLocationID"] == dropoff_lookup["dropoff_LocationID"],
         how="left",
     )
@@ -371,10 +406,36 @@ def enrich_with_zones(spark: SparkSession, df: DataFrame, lookup_path: Path) -> 
         "pickup_date",
         "source_file",
         "ingested_at",
+        "payment_type",
     ).show(5, truncate=False)
 
     return df
 
+def summary_table(df: DataFrame) -> DataFrame:
+    """
+    Create a summary table with total trips, average fare, and total amount by payment type and pickup month.
+    This is the extra task from github
+    """
+    try:
+        payment_summary = (
+        df.groupBy(
+            "payment_type",
+            F.date_format("pickup_date", "yyyy-MM").alias("pickup_year_month")
+        )
+        .agg(
+            F.count("*").alias("trip_count"),
+            F.avg("fare_amount").alias("avg_fare_amount"),
+            F.sum("total_amount").alias("total_amount")
+        )
+        #.orderBy("pickup_year_month", "payment_type") Unencessary for a write operation, and can be costly  because it triggers a shuffle
+        )
+        print("\npayment_summary table created successfully.")
+
+    except Exception as e:
+        print(f"Error creating summary table: {e}")
+        raise
+
+    return payment_summary
 
 
 # ===================================================================
@@ -407,8 +468,32 @@ def main() -> None:
 
         # ===== Enrichment =====
         df = enrich_with_zones(spark, df, LOOKUP_PATH)
-        print("\nFinal row count after enrichment:", df.count())
-    
+        df.cache() # Cache the enriched DataFrame since it will be used multiple times (for writing and summary), avoids recomputation
+
+        final_row_count: int = df.count()
+        print("\nFinal row count after enrichment:", final_row_count)
+
+        # ===== Extra Task: Summary Table =====
+        payment_summary = summary_table(df)
+
+        # ==== Output and Manifest update =====
+        OUTBOX_DIR.mkdir(parents= True, exist_ok=True)
+
+        payment_summary.write.mode("overwrite").parquet(str(OUTBOX_DIR / "payment_summary.parquet"))
+        df.write.mode("append").parquet(str(OUTBOX_DIR / "trips_enriched.parquet"))
+        df.unpersist() # Unpersist the DataFrame to free up RAM
+        update_manifest(manifest, new_files, ingestion_ts, final_row_count)
+
+        # Pipeline duration logging
+        pipeline_end =datetime.now(timezone.utc)
+        duration = (pipeline_end - ingestion_ts).total_seconds()
+        print(f"\nPipeline completed successfully in {duration:.2f} seconds.")
+
+        try:
+            input("\nPress Enter to stop Spark and exit...") # For UI
+        except EOFError:
+            print("\nNon-interactive mode detected, exiting.")    
+
     except Exception as e:
         print("\nPipeline failed:", e)
         raise
@@ -416,6 +501,6 @@ def main() -> None:
     finally:
         spark.stop()
 
-
 if __name__ == "__main__":
     main()
+
