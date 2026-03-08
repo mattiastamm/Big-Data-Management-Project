@@ -489,10 +489,10 @@ def main() -> None:
         duration = (pipeline_end - ingestion_ts).total_seconds()
         print(f"\nPipeline completed successfully in {duration:.2f} seconds.")
 
-        try:
-            input("\nPress Enter to stop Spark and exit...") # For UI
-        except EOFError:
-            print("\nNon-interactive mode detected, exiting.")    
+        #try:
+        #    input("\nPress Enter to stop Spark and exit...") # For UI
+        # except EOFError:
+        #    print("\nNon-interactive mode detected, exiting.")    
 
     except Exception as e:
         print("\nPipeline failed:", e)

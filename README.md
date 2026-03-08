@@ -11,7 +11,7 @@ Place input parquet files into `data/inbox/`, then:
 
 ```bash
 docker compose build
-docker compose up
+docker compose run --rm spark-job
 ```
 
 The pipeline will automatically detect new parquet files, process and clean the data, remove duplicates, enrich with taxi zone information, and update `state/manifest.json` to track processed files.
